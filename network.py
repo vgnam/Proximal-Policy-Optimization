@@ -1,65 +1,81 @@
 import torch
 import torch.nn as nn
-import torch.distributions as D
+import torch.nn.functional as F
+from torch.distributions import Categorical
 
 
-class ActorCritic(nn.Module):
-    def __init__(self, obs_shape, action_dim, discrete=True):
-        super().__init__()
-        self.discrete = discrete
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # For MLP, we expect the observation shape to be a flattened 1D vector
-        input_dim = obs_shape  # The input dimension is the size of the flattened observation
+class Actor(nn.Module):
+    def __init__(self, input_channels=3, action_size=4):
+        super(Actor, self).__init__()
+        self.conv1 = self.block(input_channels, 32)
+        self.conv2 = self.block(32, 64)
+        self.conv3 = self.block(64, 128)
+        self.conv4 = self.block(128, 128)
+        self.fc1 = nn.Linear(128, 64)
+        self.fc2 = nn.Linear(64, 32)
+        self.fc3 = nn.Linear(32, action_size)
+        self.adaptive_pool = nn.AdaptiveAvgPool2d(1)
 
-        # Shared MLP Encoder
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, 16),
-            nn.ReLU(),
-            nn.Linear(16, 8),
-            nn.ReLU(),
+    def block(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
+        return nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.AvgPool2d(kernel_size=2, stride=2)
         )
 
-        # Actor Head
-        if discrete:
-            self.actor = nn.Sequential(
-                nn.Linear(8, 8),
-                nn.ReLU(),
-                nn.Linear(8, action_dim)
-            )
-        else:
-            self.actor_mean = nn.Sequential(
-                nn.Linear(512, 512),
-                nn.ReLU(),
-                nn.Linear(512, action_dim)
-            )
-            self.actor_log_std = nn.Parameter(torch.zeros(action_dim))
+    def forward(self, state):
+        x = self.conv1(state)
+        x = self.conv2(x)
+        x = self.conv3(x)
+        x = self.conv4(x)
+        x = self.adaptive_pool(x)
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
 
-        # Critic Head
-        self.critic = nn.Sequential(
-            nn.Linear(8, 4),
-            nn.ReLU(),
-            nn.Linear(4, 1)
+        # Normalize activations in the final layer (output logits)
+        x = F.relu(x)  # Applying ReLU after final layer
+        distribution = Categorical(logits=x)
+        return distribution
+
+
+# Critic Network
+class Critic(nn.Module):
+    def __init__(self, input_channels=3):
+        super(Critic, self).__init__()
+        self.conv1 = self.block(input_channels, 32)
+        self.conv2 = self.block(32, 64)
+        self.conv3 = self.block(64, 64)
+        self.conv4 = self.block(64, 128)
+        self.conv5 = self.block(128, 128)
+        self.fc1 = nn.Linear(128, 64)
+        self.fc2 = nn.Linear(64, 32)
+        self.fc3 = nn.Linear(32, 1)
+        self.adaptive_pool = nn.AdaptiveAvgPool2d(1)
+
+    def block(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1):
+        return nn.Sequential(
+            nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.AvgPool2d(kernel_size=2, stride=2)
         )
 
-        self.to(self.device)
+    def forward(self, state):
+        x = self.conv1(state)
+        x = self.conv2(x)
+        x = self.conv3(x)
+        x = self.conv4(x)
+        x = self.conv5(x)
+        x = self.adaptive_pool(x)
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        x = self.fc3(x)
 
-    def forward(self, obs):
-        # Normalize image or input vector if needed
-        obs = obs / 255.0 if obs.max() > 1 else obs  # Normalize to [0, 1] if required
+        return x
 
-        # Pass the observation through the encoder (MLP)
-        feat = self.encoder(obs)
 
-        # Actor: Discrete or Continuous
-        if self.discrete:
-            logits = self.actor(feat)
-            dist = D.Categorical(logits=logits)
-        else:
-            mean = self.actor_mean(feat)
-            std = self.actor_log_std.exp()
-            dist = D.Normal(mean, std)
-
-        # Critic: Value function
-        value = self.critic(feat).squeeze(-1)
-        return dist, value
